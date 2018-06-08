@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
 
 public class TCPSocket {
 
@@ -19,19 +20,26 @@ public class TCPSocket {
     private PrintStream out;
     private BufferedReader buf;
 
-    private boolean closed;
+    private volatile boolean closed = true;
 
-    private Thread sendThread;
-    private Thread receiveThread;
+    private Runnable sender;
+    private Runnable receiver;
 
+    /**
+     * Build a TCPSocket with default send buffer size 32
+     */
     public TCPSocket() {
-        this(64);
+        this(32);
     }
 
+    /**
+     * Build a TCPSocket
+     * @param sendBufferSize    Size for send buffer where messages will be stored before actually being sent out
+     */
     public TCPSocket(int sendBufferSize) {
         outputQ = new ArrayBlockingQueue<>(sendBufferSize);
 
-        sendThread = new Thread(() -> {
+        sender = () -> {
             try {
                 while (isActive()) {
                     out.println(outputQ.take());
@@ -40,9 +48,9 @@ public class TCPSocket {
             } finally {
                 close();
             }
-        });
+        };
 
-        receiveThread = new Thread(() -> {
+        receiver = () -> {
             try {
                 while (isActive()) {
                     String msg = buf.readLine();
@@ -55,7 +63,7 @@ public class TCPSocket {
             } finally {
                 close();
             }
-        });
+        };
     }
 
 
@@ -66,12 +74,13 @@ public class TCPSocket {
     public synchronized void close() {
         if (isActive()) {
             closed = true;
-            out.close();
-            sendThread.interrupt();
             try {
-                buf.close();
+                sendMessage(""); // notify sender so that it can shutdown
+                out.close();
+                buf.close(); // This will cause a IOException in receiver so that the thread will stop
                 socket.close();
-            } catch (IOException ignored) {}
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -82,20 +91,39 @@ public class TCPSocket {
     }
 
     public void addHandler(MessageHandler handler) {
-        handlers.add(handler);
+        this.handlers.add(handler);
+    }
+
+    public void addHandlers(Iterable<MessageHandler> newHandlers) {
+        newHandlers.forEach(this::addHandler);
     }
 
     public void removeHandler(MessageHandler handler) {
         handlers.remove(handler);
     }
 
-    public void startEventLoop(Socket socket) throws IOException {
-        this.socket = socket;
-        closed = false;
-        out = new PrintStream(socket.getOutputStream());
-        buf = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+    private boolean setupConnection(Socket socket) throws IOException {
+        if (!isActive()) {
+            this.closed = false;
+            this.socket = socket;
+            out = new PrintStream(socket.getOutputStream());
+            buf = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            return true;
+        }
+        return false;
+    }
 
-        sendThread.start();
-        receiveThread.start();
+    public void startEventLoop(Socket socket) throws IOException {
+        if (setupConnection(socket)) {
+            new Thread(sender).start();
+            new Thread(receiver).start();
+        }
+    }
+
+    public void startEventLoop(Socket socket, ExecutorService threadPool) throws IOException {
+        if (setupConnection(socket)) {
+            threadPool.execute(sender);
+            threadPool.execute(receiver);
+        }
     }
 }
